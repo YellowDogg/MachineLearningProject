@@ -1,0 +1,542 @@
+---
+title: "Using Sensors to Assess Exercise Form"
+output: html_document
+---
+
+```{r DataPreparation_, echo = FALSE, message = FALSE}
+
+# Load required libraries
+library(ggplot2)
+library(reshape2)
+library(plyr)
+library(caret)
+library(randomForest)
+library(pander)
+
+# Load data set
+dataset <- read.csv("pml-training.csv")
+
+# Create lists of the different sensor types, locations and axis
+sensorTypes <- c("gyros", "accel", "magnet")
+calcTypes <- c("roll", "pitch", "yaw", "total_accel")
+locations <- c("belt", "forearm", "arm", "dumbbell")
+axis <- c("x", "y", "z")
+
+# Create function that generates the full set of field names from the types, locations and axis
+# Also will be used to create set of field names if not all locations are used
+createFields <- function(sensorTypes = NULL, calcTypes = NULL, locations, axis) {
+  
+  if (!is.null(sensorTypes)){
+    # Create all combinations of sensorTypes, locations and axis
+    temp <- merge(merge(data.frame(sensorTypes), data.frame(locations)), 
+                  data.frame(axis))
+    sensorFields <- as.character(paste(temp[,1], temp[,2], temp[,3], sep = "_"))
+  } else {
+    sensorFields <- NULL
+  }
+  if (!is.null(calcTypes)) {
+    # Create all combinations of calcType and locations 
+    temp <- merge(data.frame(calcTypes), data.frame(locations))
+    calcFields <- as.character(paste(temp[,1], temp[,2], sep = "_"))
+  } else {
+    calcFields <- NULL
+  }
+  # Return the full set of all combinations created above
+  c(calcFields, sensorFields)
+}
+
+# Generate full set of field names to subset data on, then get rid of unused data columns
+fieldNames <- createFields(sensorTypes, calcTypes, locations, axis)
+dataset <- dataset[, c("classe", fieldNames)]
+
+# Prove their are no NAs; if so, the following equation should evaluate to 0
+number_of_NAs <- sum(sapply(names(dataset), function(x) sum(is.na(dataset[, x]))))
+
+# Create training and x-validation data sets
+set.seed(1000)
+inTrain <- createDataPartition(dataset$classe, p = 0.4, list = FALSE)[,1]
+train <- dataset[inTrain, ]
+xval <- dataset[-inTrain, ]
+```
+
+```{r DataExploration_, echo = FALSE}
+
+# To make the dataset easier to work with using ggplot plotting
+# The multiple data fields are "melted" into a single long column with name "Value"
+# A separate column "Measurement" holds the name of the original field associated with each value
+trainMelt <- melt(train, id.vars=1, measure.vars=2:53, 
+                  variable.name="Measurement", value.name="Value")
+
+# To allow the different features to be plotted on the same scales, the data for each feature is standardized
+trainMelt <- ddply(trainMelt, ~ Measurement, mutate, 
+                   StandValue = (Value - mean(Value)) / sd(Value))
+
+# ggplot is used to generate a facet plot with density plots for each feature
+# Within each facet, the density plots are colored by classe
+# To make the plots cleaner, I eliminated a outliers further than 4 sd from mean
+plot1 <- ggplot(data=trainMelt[trainMelt$StandValue < 4 & trainMelt$StandValue > -4, ])
+plot1 <- plot1 + geom_density(aes(StandValue, colour = classe))
+plot1 <- plot1 + facet_wrap(~ Measurement, nrow = 11, ncol = 5)
+plot1 <- plot1 + scale_x_continuous("Standardized Value", limits = c(-4,4))
+plot1 <- plot1 + scale_color_manual(values=c("red", "gray", "gray", 
+                                             "gray", "gray", "gray"))
+plot1 <- plot1 + theme_bw()
+
+remove(trainMelt)
+#plot1
+```
+
+```{r RandomForestTraining_, echo = FALSE, cache = TRUE}
+
+# Generate a list with vectors with all the possible combinations of sensor locations
+# For example each sensor location (e.g., arm) by itself, each possible sets of 2, 3 or 4 locations
+combos <- lapply(1:4, function(x) combn(locations, x, simplify = FALSE))
+combos <- unlist(combos, recursive=FALSE)
+
+# Create variables to hold results
+bestModel = NULL # will hold the model (the combination of sensor locations) with the best accuracy
+bestAccuracy = 0 # will hold the accuracy of the best model
+bestConfMatrix = NULL # will hold the out-sample confusion matrix for best model
+# The results data frame will hold model statistics for each model that is tested
+results <- data.frame(Index = 1:length(combos), # The model number
+                      Locations = sapply(combos, function(x) paste(x, collapse = "+")), # the sensor locations in the model
+                      NumOfSensorSites = sapply(combos, function(x) length(x)), # the number of sensor locations in the model
+                      InSampleAccuracy = rep(0.0, length(combos)), # the in-sample accuracy
+                      InSampleAccSD = rep(0.0, length(combos)), # the sd for the in-sample accuracy
+                      OutSampleAccuracy = rep(0.0, length(combos)), # the out of sample accuracy
+                      OutSampleAccLCI = rep(0.0, length(combos)), # the lower 95% CI for the out of sample accuracy
+                      OutSampleAccUCI = rep(0.0, length(combos))) # the upper 95% CI for the out of sample accuracy   
+
+# Generate and test random forest model for each possible combination of sensor sites
+for (i in 1:length(combos)) {
+  
+  # Generate the data fields to use in the analysis (for the given subset of sensor locations)
+  fields <- createFields(sensorTypes = sensorTypes, 
+                         calcTypes = calcTypes,
+                         locations =  combos[[i]], 
+                         axis = axis)
+  # Create model using 5-fold cross-validation to optimize the mtry parameter
+  trCntrl <- trainControl(method = "cv", number = 5)
+  model <- train(classe ~ ., data = train[ , c("classe", fields)], 
+                 method = "rf", prox = TRUE, trControl = trCntrl)
+  
+  # Save in-sample results (accuracy mean and standard deviation) in results dataframe
+  results$InSampleAccuracy[i] <- mean(model$resample$Accuracy)
+  results$InSampleAccSD[i] <- sd(model$resample$Accuracy)
+  
+  # Get out-sample results (accuracy estimate and lower/upp confidence limits)
+  # Save the accuracy and confidence limits in results dataframe
+  predictions <- predict(model, xval[ , fields])
+  confMatrix <- confusionMatrix(predictions, xval$classe)
+  outAccuracy <- confMatrix$overall[[1]]
+  results$OutSampleAccuracy[i] <- outAccuracy
+  results$OutSampleAccLCI[i] <- confMatrix$overall[[3]]
+  results$OutSampleAccUCI[i] <- confMatrix$overall[[4]]
+  
+  # If the current model is the best model so far, update best model variables
+  if (outAccuracy > bestAccuracy) {
+    bestAccuracy <- outAccuracy
+    bestConfMatrix <- confMatrix
+    bestModel <- model
+  }
+  
+}   
+```
+
+```{r Results_, echo = FALSE}
+
+# Make a nice printable table of the results dataframe
+Model <- results$Index
+N_Sensors = results$NumOfSensorSites
+Sensors = results$Locations
+InSampleAccuracy = as.character(round(results$InSampleAccuracy, 3))
+OutSampleAccuracy_CI = paste(as.character(signif(results$OutSampleAccuracy, 3)),
+                             " (", as.character(signif(results$OutSampleAccLCI, 3)), ", ",
+                             as.character(signif(results$OutSampleAccUCI, 3)), 
+                             ")", sep = "")
+resultsToPrint <- data.frame(Model, N_Sensors, Sensors, InSampleAccuracy, 
+                             OutSampleAccuracy_CI)
+names(resultsToPrint) <- c("Model#", "#OfSensors", "SensorNames", 
+                           "InSampleAccuracy", "OutSampleAccuracy (95%CI)")
+
+# Note:  will print the table inline with the text
+#pandoc.table(resultsToPrint, split.table = 400, style = "simple", 
+#             emphasize.strong.cells = matrix(c(rep(1,5), rep(5,5), rep(12, 5), rep(15,5), 
+#                                               rep(seq(1:5), 4)), 20, 2))
+
+# Make a nice printable table of the confusion matrix for the best model
+confMatrixToPrint <- bestConfMatrix[[2]]
+confMatrixToPrint <- rbind(confMatrixToPrint, Sensitivity =
+                           sapply(1:5, function(x) {
+                             confMatrixToPrint[x, x]/ sum(confMatrixToPrint[, x])
+                           }))
+confMatrixToPrint <- rbind(confMatrixToPrint, Specificity =
+                             sapply(1:5, function(x) {
+                               sum(confMatrixToPrint[-x, -x]) / sum(confMatrixToPrint[, -x])
+                             }))
+confMatrixToPrint <- signif(confMatrixToPrint, 4)
+dimnames(confMatrixToPrint) <- list(Predicted = c("Predicted A","Predicted B","Predicted C", "Predicted D", "Predicted E", "Sensitivity", "Specificity"),
+                                    Reference = c("True A", "True B", "True C", "True D", "True E"))
+
+# Note:  will print table inline with the text
+#pander(confMatrixToPrint, signif = 4, split.table = 200, style = "simple",
+#       emphasize.strong.cells = matrix(c(rep(6, 5), rep(7, 5),
+#                                         rep(seq(1:5), 2)), 10, 2))
+
+# Generate a plot of accuracy (insample and outsample) vs. the number of sensor locations for all the models
+plot2 <- ggplot(data = melt(results, id.vars = "NumOfSensorSites", 
+                            measure.vars = c("InSampleAccuracy", "OutSampleAccuracy"),
+                            variable.name = "InVsOut",
+                            value.name = "Accuracy"))
+plot2 <- plot2 + geom_point(aes(x = NumOfSensorSites, y = Accuracy, colour = InVsOut),
+                            shape = 19, size = 2, position = position_jitter(width = 0.1, height = 0))
+plot2 <- plot2 + scale_colour_manual(name = "Data", labels = c("Training", "X-Validation"), values = c("red", "blue"))
+plot2 <- plot2 + scale_x_continuous("Number of Sensors", limits = c(0,5))
+plot2 <- plot2 + scale_y_continuous("Accuracy", limits = c(0,1))
+plot2 <- plot2 + theme_bw()
+plot2 <- plot2 + theme(title = element_text(size = 16, face = "bold"),
+                       axis.title.y = element_text(vjust = 1),
+                       text = element_text(size = 14),
+                       legend.position = c(0.5, 0.5))
+
+# Will print plot inline with text                       
+#plot2
+```
+
+```{r Prediction_, echo = FALSE}
+
+# Load data set
+testset <- read.csv("pml-testing.csv")
+
+# Subset on required data columns
+testset <- testset[, fieldNames]
+
+# Predict classe for each row of testset using the best model
+predictions <- predict(bestModel, testset[ , fieldNames])
+
+# Set up dataframe with test observation number and predicted classe (lift form category)
+testResults <- data.frame(TestObservation = 1:length(predictions), PredictedClasse = predictions)
+
+# Turn into nice table
+# Note will print table inline with text
+# pander(testResults)
+
+```
+
+# Executive Summary  
+This report describes the use of motion sensors to determine if individuals conducting dumbbell lifts use correct lifting form.  Data was analyzed from sensors placed on four locations:  the belt, arm, forearm and on the dumbbell. The question that was addressed was whether all the sensor locations were required to provide maximum prediction accuracy or if a smaller set of sensor locations was sufficient. A training data set was used to develop random forest models for each possible combination of sensor locations.  A cross-validation data set was used to compare the out-of-sample accuracy for each of these models and to select the best performing model. The results indicated that the full four sensor location model provided the best accuracy for categorizing a lift as using proper form or as using one of five different incorrect forms:  out-of-sample accuracy (95% CI) = `r resultsToPrint[15, 5]`.  Models employing only one sensor location performed significantly worse.  A two location model (`r resultsToPrint[5, 3]`), however, was almost as accurate as the four sensor model:  out-of-sample accuracy (95% CI) = `r resultsToPrint[5, 5]`.      
+ 
+
+# Data    
+The dataset (described in http://groupware.les.inf.puc-rio.br/har) is sensor information from sensors worn on the belt, forearm, arm and dumbell of 6 individuals while they did barbell lifts.  During each lift, sensor information was collected at multiple time points.  The individuals carried out the lifts correctly or in 5 different incorrect procedures.  The fields in the data set that were used in the analysis are described below:  
+**Outcome Classification Field**  
+classe:  A (correct form) or B through E (incorrect forms)  
+**Input Features**  
+Only sensor fields collected at all time points were used.  The input field names have the general form:  
+\<type\>-\<location\>-\<axis\>  
+where:  
+\<type\> is the sensor component used for the measurement (gyros, accel or magnet) or a calculated measurement employing readings from multiple components (roll, pitch, yaw or total_accel)  
+\<location\> is the sensor location (belt, forearm, arm or dumbell)  
+\<axis\> is the axis of measurement (x, y or z) and is not included for the calculated measurement types  
+Once the dataset was subsetted to the selected fields, there were `r number_of_NAs` NAs in the data.  
+
+To allow for optimization of the set of features used in the prediction algorithm, the data set was divided into a training set for training the algorithm and a cross-validation set for selecting the optimal feature set.  The training set was made relatively small (40% of all data) to keep the time for training reasonable.  Final validation will be carried out with a separate blinded data set.   
+
+(See Code Chunk "Data Preparation" in the Appendix for the code used to load and prepare the data)  
+
+
+# Data Exploration      
+Density plots were generated to examine whether any individual data field was likely to be predictive of good exercise form.  Figure 1 shows only one feature (pitch_forearm) where the density curve for correct exercise form had a clear region that did not overlap with the curves for poor form.  What appeared more common was for the correct exercise form to have a relatively sharp distribution compared to relatively broad distributions for the incorrect forms (see, for example, the panels for gyros_arm_x and gyros_forearm_y ).  By eye, there did not appear to be any single feature that would be highly predictive the classe variable, indicating the value of examining multiparameter approaches.  
+
+(See Code Chunk "Data Exploration" in the Appendix for the code used to explore the data) 
+
+```{r, fig.width = 10, fig.height = 11, echo = FALSE}
+plot1
+```
+
+**Figure 1.** Density plots for each sensor data feature.  The sensor values for each feature were standardized - (value - mean)/sd - to allow the use of a common x scale.  The density curves are colored by outcome class.  The correct exercise form (classe = A) is colored red, while all the incorrect forms (classe = B, C, D or E) are colored gray to make it easy to pick out the curve for the correct form.  
+
+# Development of a Random Forest Classifier for Predicting the Classe Variable  
+The training set was used to train random forest models with the caret package.  The "cv" method was used for reampling cross-validation and a relatively small number of resamples were used (n = 5) to reduce training time, otherwise the default caret parameters were used.  The training was then repeated with each possible combination of sensor locations to determine the minimal number of sensor locations needed to maximize performance.  Out-of-sample performance with the cross-validation data set was used to compare the performance for each of the models.
+
+(See Code Chunk "Random Forrest Training" in the Appendix for the code used to train the models)  
+
+# Results  
+The accuracy of each of the models is provided in Table 1.  Figure 2 plots the in-sample and out-of-sample accuracy for each model as function of the number of sensor locations in the model.  The plot and table show an improvement in accuracy with increasing number of sensors, although the difference between the 3 and 4 sensor models was fairly small and there were some comparable two sensor models.  The four sensor location model gave the best out-of-sample accuracy (95%CI) = `r resultsToPrint[15, 5]`.  The number of sensors could be reduced to two locations (`r resultsToPrint[5, 3]`), however, with only a minor loss of accuracy.  This two sensor location model had an accuracy - `r resultsToPrint[5, 5]`.  The plot also shows that the in-sample and out-of-sample accuracy were similar, indicating that the models did not appear to significantly over-fit the training data.   
+  
+The confusion matrix for the best performing (four sensor location) model is provided in Table 2.  
+  
+```{r, echo = FALSE}  
+
+pander(resultsToPrint, split.table = 400, style = "simple", 
+             emphasize.strong.cells = matrix(c(rep(1,5), rep(5,5), rep(12, 5), rep(15,5), 
+                                               rep(seq(1:5), 4)), 20, 2))
+```  
+
+**Table 1.** In sample (training set) and out of sample (x-validation set) accuracy for random forest models used to categorize weight lifting form.  The models employed each possible combination of motion sensor locations (belt, arm, forearm and dumbbell).  For each model, the table provides the number of location sensors, the actual sensor locations used, the in sample accuracy and the out of sample accuracy (and 95% confidence limit).  The best combination of sensor locations for a give number of sensor locations are highlighted in bold.   
+
+```{r, echo = FALSE, fig.width = 7, fig.height = 4}  
+plot2
+```  
+
+**Figure 2.** The plot shows the prediction accuracy - in sample (training data) and out of sample (x-validation data) - for each of the models listed in Table 1 as a function of the number of sensor locations used.  The points are slightly jittered in the x direction to make it easier to see overlapping points.
+
+```{r, echo = FALSE}  
+
+pander(confMatrixToPrint, signif = 4, split.table = 200, style = "simple",
+       emphasize.strong.cells = matrix(c(rep(6, 5), rep(7, 5),
+                                         rep(seq(1:5), 2)), 10, 2))
+```  
+
+**Table 2.** Confusion matrix for the best random forest model (the model employing all four sensor locations: model #15 in Table 1).  The model was applied to the cross-validation data and the number of observations was broken down by predicted category vs. true category for lifting form.  The table also shows the sensitivity and specificity for identifying each of the 5 categories.  
+  
+(See Code Chunk "Results" in the Appendix for the code used to generate Figure 2 and Tables 1 and 2)  
+
+# Prediction of Lifting Form for Blinded Test Data Set 
+The best performing 4-sensor location model was applied to the blinded test data.  The predicted lifting form class (classe) for each of the test rows is shown in Table 2.  
+
+```{r, echo = FALSE}
+pander(testResults)
+```
+
+(See Code Chunk "Prediction" in the Appendix for the code used to generate Table 2)  
+
+# Conclusion  
+A random forest model using the data from motion sensors at four location (belt, arm, forearm and dumbbell) on an individual lifting a dumbbell was shown to be highly accurate at classifying the lift form as correct or as one of four different incorrect lift forms - accuracy (95% CI) = `r resultsToPrint[15, 5]`.  A model using only sensors at two locations (`r resultsToPrint[5, 3]`) was only slightly worse and had an accuracy (95%) = `r resultsToPrint[5, 5]`.  
+
+ 
+# Appendix - R Code  
+
+## Data Preparation  
+
+```{r DataPreparation, eval = FALSE}
+
+# Load required libraries
+library(ggplot2)
+library(reshape2)
+library(plyr)
+library(caret)
+library(randomForest)
+library(pander)
+
+# Load data set
+dataset <- read.csv("pml-training.csv")
+
+# Create lists of the different sensor types, locations and axis
+sensorTypes <- c("gyros", "accel", "magnet")
+calcTypes <- c("roll", "pitch", "yaw", "total_accel")
+locations <- c("belt", "forearm", "arm", "dumbbell")
+axis <- c("x", "y", "z")
+
+# Create function that generates the full set of field names from the types, locations and axis
+# Also will be used to create set of field names if not all locations are used
+createFields <- function(sensorTypes = NULL, calcTypes = NULL, locations, axis) {
+  
+  if (!is.null(sensorTypes)){
+    # Create all combinations of sensorTypes, locations and axis
+    temp <- merge(merge(data.frame(sensorTypes), data.frame(locations)), 
+                  data.frame(axis))
+    sensorFields <- as.character(paste(temp[,1], temp[,2], temp[,3], sep = "_"))
+  } else {
+    sensorFields <- NULL
+  }
+  if (!is.null(calcTypes)) {
+    # Create all combinations of calcType and locations 
+    temp <- merge(data.frame(calcTypes), data.frame(locations))
+    calcFields <- as.character(paste(temp[,1], temp[,2], sep = "_"))
+  } else {
+    calcFields <- NULL
+  }
+  # Return the full set of all combinations created above
+  c(calcFields, sensorFields)
+}
+
+# Generate full set of field names to subset data on, then get rid of unused data columns
+fieldNames <- createFields(sensorTypes, calcTypes, locations, axis)
+dataset <- dataset[, c("classe", fieldNames)]
+
+# Prove their are no NAs; if so, the following equation should evaluate to 0
+number_of_NAs <- sum(sapply(names(dataset), function(x) sum(is.na(dataset[, x]))))
+
+# Create training and x-validation data sets
+set.seed(1000)
+inTrain <- createDataPartition(dataset$classe, p = 0.4, list = FALSE)[,1]
+train <- dataset[inTrain, ]
+xval <- dataset[-inTrain, ]
+```
+
+## Data Exploration  
+
+```{r DataExploration, eval = FALSE}
+
+# To make the dataset easier to work with using ggplot plotting
+# The multiple data fields are "melted" into a single long column with name "Value"
+# A separate column "Measurement" holds the name of the original field associated with each value
+trainMelt <- melt(train, id.vars=1, measure.vars=2:53, 
+                  variable.name="Measurement", value.name="Value")
+
+# To allow the different features to be plotted on the same scales, the data for each feature is standardized
+trainMelt <- ddply(trainMelt, ~ Measurement, mutate, 
+                   StandValue = (Value - mean(Value)) / sd(Value))
+
+# ggplot is used to generate a facet plot with density plots for each feature
+# Within each facet, the density plots are colored by classe
+# To make the plots cleaner, I eliminated a outliers further than 4 sd from mean
+plot1 <- ggplot(data=trainMelt[trainMelt$StandValue < 4 & trainMelt$StandValue > -4, ])
+plot1 <- plot1 + geom_density(aes(StandValue, colour = classe))
+plot1 <- plot1 + facet_wrap(~ Measurement, nrow = 11, ncol = 5)
+plot1 <- plot1 + scale_x_continuous("Standardized Value", limits = c(-4,4))
+plot1 <- plot1 + scale_color_manual(values=c("red", "gray", "gray", 
+                                             "gray", "gray", "gray"))
+plot1 <- plot1 + theme_bw()
+
+remove(trainMelt)
+#plot1
+```
+
+## Random Forest Training  
+
+```{r RandomForestTraining, eval = FALSE}
+
+# Generate a list with vectors with all the possible combinations of sensor locations
+# For example each sensor location (e.g., arm) by itself, each possible sets of 2, 3 or 4 locations
+combos <- lapply(1:4, function(x) combn(locations, x, simplify = FALSE))
+combos <- unlist(combos, recursive=FALSE)
+
+# Create variables to hold results
+bestModel = NULL # will hold the model (the combination of sensor locations) with the best accuracy
+bestAccuracy = 0 # will hold the accuracy of the best model
+bestConfMatrix = NULL # will hold the out-sample confusion matrix for best model
+# The results data frame will hold model statistics for each model that is tested
+results <- data.frame(Index = 1:length(combos), # The model number
+                      Locations = sapply(combos, function(x) paste(x, collapse = "+")), # the sensor locations in the model
+                      NumOfSensorSites = sapply(combos, function(x) length(x)), # the number of sensor locations in the model
+                      InSampleAccuracy = rep(0.0, length(combos)), # the in-sample accuracy
+                      InSampleAccSD = rep(0.0, length(combos)), # the sd for the in-sample accuracy
+                      OutSampleAccuracy = rep(0.0, length(combos)), # the out of sample accuracy
+                      OutSampleAccLCI = rep(0.0, length(combos)), # the lower 95% CI for the out of sample accuracy
+                      OutSampleAccUCI = rep(0.0, length(combos))) # the upper 95% CI for the out of sample accuracy   
+
+# Generate and test random forest model for each possible combination of sensor sites
+for (i in 1:length(combos)) {
+  
+  # Generate the data fields to use in the analysis (for the given subset of sensor locations)
+  fields <- createFields(sensorTypes = sensorTypes, 
+                         calcTypes = calcTypes,
+                         locations =  combos[[i]], 
+                         axis = axis)
+  # Create model using 5-fold cross-validation to optimize the mtry parameter
+  trCntrl <- trainControl(method = "cv", number = 5)
+  model <- train(classe ~ ., data = train[ , c("classe", fields)], 
+                 method = "rf", prox = TRUE, trControl = trCntrl)
+  
+  # Save in-sample results (accuracy mean and standard deviation) in results dataframe
+  results$InSampleAccuracy[i] <- mean(model$resample$Accuracy)
+  results$InSampleAccSD[i] <- sd(model$resample$Accuracy)
+  
+  # Get out-sample results (accuracy estimate and lower/upp confidence limits)
+  # Save the accuracy and confidence limits in results dataframe
+  predictions <- predict(model, xval[ , fields])
+  confMatrix <- confusionMatrix(predictions, xval$classe)
+  outAccuracy <- confMatrix$overall[[1]]
+  results$OutSampleAccuracy[i] <- outAccuracy
+  results$OutSampleAccLCI[i] <- confMatrix$overall[[3]]
+  results$OutSampleAccUCI[i] <- confMatrix$overall[[4]]
+  
+  # If the current model is the best model so far, update best model variables
+  if (outAccuracy > bestAccuracy) {
+    bestAccuracy <- outAccuracy
+    bestConfMatrix <- confMatrix
+    bestModel <- model
+  }
+  
+}   
+```
+
+## Results  
+
+```{r Results, eval = FALSE}
+
+# Make a nice printable table of the results dataframe
+Model <- results$Index
+N_Sensors = results$NumOfSensorSites
+Sensors = results$Locations
+InSampleAccuracy = as.character(round(results$InSampleAccuracy, 3))
+OutSampleAccuracy_CI = paste(as.character(signif(results$OutSampleAccuracy, 3)),
+                             " (", as.character(signif(results$OutSampleAccLCI, 3)), ", ",
+                             as.character(signif(results$OutSampleAccUCI, 3)), 
+                             ")", sep = "")
+resultsToPrint <- data.frame(Model, N_Sensors, Sensors, InSampleAccuracy, 
+                             OutSampleAccuracy_CI)
+names(resultsToPrint) <- c("Model#", "#OfSensors", "SensorNames", 
+                           "InSampleAccuracy", "OutSampleAccuracy (95%CI)")
+
+# Note:  will print the table inline with the text
+#pandoc.table(resultsToPrint, split.table = 400, style = "simple", 
+#             emphasize.strong.cells = matrix(c(rep(1,5), rep(5,5), rep(12, 5), rep(15,5), 
+#                                               rep(seq(1:5), 4)), 20, 2))
+
+# Make a nice printable table of the confusion matrix for the best model
+confMatrixToPrint <- bestConfMatrix[[2]]
+confMatrixToPrint <- rbind(confMatrixToPrint, Sensitivity =
+                           sapply(1:5, function(x) {
+                             confMatrixToPrint[x, x]/ sum(confMatrixToPrint[, x])
+                           }))
+confMatrixToPrint <- rbind(confMatrixToPrint, Specificity =
+                             sapply(1:5, function(x) {
+                               sum(confMatrixToPrint[-x, -x]) / sum(confMatrixToPrint[, -x])
+                             }))
+confMatrixToPrint <- signif(confMatrixToPrint, 4)
+dimnames(confMatrixToPrint) <- list(Predicted = c("Predicte A","Predicted B","Predicted C", "Predicted D", "Predicted E", "Sensitivity", "Specificity"),
+                                    Reference = c("True A", "True B", "True C", "True D", "True E"))
+
+# Note:  will print table inline with the text
+#pander(confMatrixToPrint, signif = 4, split.table = 200, style = "simple",
+#       emphasize.strong.cells = matrix(c(rep(6, 5), rep(7, 5),
+#                                         rep(seq(1:5), 2)), 10, 2))
+
+# Generate a plot of accuracy (insample and outsample) vs. the number of sensor locations for all the models
+plot2 <- ggplot(data = melt(results, id.vars = "NumOfSensorSites", 
+                            measure.vars = c("InSampleAccuracy", "OutSampleAccuracy"),
+                            variable.name = "InVsOut",
+                            value.name = "Accuracy"))
+plot2 <- plot2 + geom_point(aes(x = NumOfSensorSites, y = Accuracy, colour = InVsOut),
+                            shape = 19, size = 4, position = position_jitter(width = 0.1, height = 0))
+plot2 <- plot2 + scale_colour_manual(name = "Data", labels = c("Training", "X-Validation"), values = c("red", "blue"))
+plot2 <- plot2 + scale_x_continuous("Number of Sensors", limits = c(0,5))
+plot2 <- plot2 + scale_y_continuous("Accuracy", limits = c(0,1))
+plot2 <- plot2 + theme_bw()
+plot2 <- plot2 + theme(title = element_text(size = 16, face = "bold"),
+                       axis.title.y = element_text(vjust = 1),
+                       text = element_text(size = 14),
+                       legend.position = c(0.5, 0.5))
+
+# Will print plot inline with text                       
+#plot2
+```
+
+## Prediction
+
+```{r Prediction, eval = FALSE}
+
+# Load data set
+testset <- read.csv("pml-testing.csv")
+
+# Subset on required data columns
+testset <- testset[, fieldNames]
+
+# Predict classe for each row of testset using the best model
+predictions <- predict(bestModel, testset[ , fieldNames])
+
+# Set up dataframe with test observation number and predicted classe (lift form category)
+testResults <- data.frame(TestObservation = 1:length(predictions), PredictedClasse = predictions)
+
+# Turn into nice table
+# Note will print table inline with text
+# pander(testResults)
+
+```
+
+
+
+
